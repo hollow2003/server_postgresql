@@ -9,3 +9,5 @@ services:
       ALLOW_IP_RANGE: 0.0.0.0/0
     ports:
       - "5432:5432"
+    volumes:
+      - ./pg-data:/var/lib/postgresql/data
