@@ -1,0 +1,11 @@
+version: '3.1'
+
+services:
+  postgres:
+    image: my_postgres_image
+    container_name: test_postgres
+    environment:
+      POSTGRES_PASSWORD: 123456
+      ALLOW_IP_RANGE: 0.0.0.0/0
+    ports:
+      - "5432:5432"
