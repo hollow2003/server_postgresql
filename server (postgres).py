@@ -14,36 +14,7 @@ import shutil
 import signal
 import subprocess
 from collections import defaultdict
-import yaml
-import argparse
-import sys
-database_config = {}
-udp_config = {}
-schema_provider_port = ""
-nginx_config = {}
-server_port = ""
-parser = argparse.ArgumentParser(description='Parse YAML file specified by path')   
-parser.add_argument('-c', '--yaml_path', type=str, required=True,
-                    help='Path to the YAML file to parse')
-args = parser.parse_args()
-yaml_path = args.yaml_path
-with open(yaml_path, 'r', encoding='utf-8') as file:
-    try:
-        config_data = yaml.safe_load(file)
-    except yaml.YAMLError as e:
-        print(f"Error parsing YAML file {yaml_path}: {e}")
-        config_data = None
-if not config_data:
-    print(f"Failed to parse YAML file at {yaml_path}")
-    sys.exit()
-else:
-    print("Load config success")
-database_config = config_data["database"]
-udp_config = config_data["udp_port"]
-schema_provider_port = config_data["schema_provider_port"]
-nginx_config = config_data["nginx"]
-server_port = config_data["server_port"]
-engine = create_engine('postgresql://' + database_config["host"] + ':' + database_config["password"] + '@' + database_config["address"] + ':' + database_config["port"] + '/postgres', echo=database_config["output_status"], future=True)
+engine = create_engine('postgresql://postgres:123456@192.168.114.128:5432/postgres', echo=True, future=True)
 app = Flask(__name__)
 Base = declarative_base()
 lock = threading.Lock()
@@ -65,14 +36,19 @@ timer = 1
 def receive_udp_message():
     global udp_message
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_socket.bind(('localhost', udp_config["port_to_listen"]))
+    udp_socket.bind(('localhost', 12345))
     while True:
-        data, addr = udp_socket.recvfrom(1024)
+        data, _ = udp_socket.recvfrom(1024)
         udp_message = data.decode()
-        parts = udp_message.split('+')
-        ip, port = addr
-        port = schema_provider_port  # modify in apply
-        hostname = parts[0]
+        parts = udp_message.split(' ')
+        port, hostname, ip = None, None, None
+        for part in parts:
+            if "PORT" in part:
+                port = part.split(":")[1]
+            elif "hostname" in part:
+                hostname = part.split(":")[1]
+            elif "IP" in part:
+                ip = part.split(":")[1]
         if port and hostname:
             address = f"http://{ip}:{port}"
             hostlist_lock.acquire()
@@ -87,7 +63,7 @@ def receive_udp_message():
 
 def get_schema(address, hostname):
     url = f"{address}/data_discovery"
-    response = requests.get(url)
+    response = requests.get(url)  
     if response.status_code == 200:
         schemas = response.json()
         hostname_schemas_orms[hostname]["schemas"] = schemas
@@ -96,8 +72,7 @@ def get_schema(address, hostname):
             schema["established"] = 0
             schema["API"]["interested"] = 0
             lock.acquire()
-            print(type(schema["id"]))
-            schema["orm"] = generate_orm(schema_to_tree(schema['schema']), schema["kind"] + "_" + str(schema["id"]), Path=hostname, required=extract_required(schema['schema']))
+            schema["orm"] = generate_orm(schema_to_tree(schema['schema']), hostname, Path=hostname, required=extract_required(schema['schema']))
             Base.metadata.create_all(engine)
             Base.metadata.clear()
             lock.release()
@@ -117,7 +92,7 @@ def generate_orm(json_tree, host_name, parent_name=None, Path='', required=[]):
     if type(json_tree) is list:
         json_tree = json_tree[0]
         if parent_name is None:
-            Path = '\\' + host_name
+            Path = '\\root'
     for key, _ in json_tree.items():
         if type(json_tree[key]) is str:
             table[key] = json_tree[key]
@@ -133,7 +108,7 @@ def generate_orm(json_tree, host_name, parent_name=None, Path='', required=[]):
         tmp = Path
         orm_classes[parent_name] = create_orm_class(Path, host_name, table, parent_name=tmp, required_fields=require)
     elif parent_name is None and table != {}:
-        orm_classes['root'] = create_orm_class('\\' + host_name, host_name, table, required_fields=require)
+        orm_classes['root'] = create_orm_class('\\root', host_name, table, required_fields=require)
     return orm_classes
 
 
@@ -216,7 +191,6 @@ def schema_to_tree(schema):
     return None
 
 
-'''
 def rtsp_thread(address):
     cap = cv2.VideoCapture(address)
     while True:
@@ -227,9 +201,9 @@ def rtsp_thread(address):
         else:
             print("Failed to read frame from RTSP stream.")
             break
+
     cap.release()
     cv2.destroyAllWindows()
-'''
 
 
 def validate_data(schema, data):
@@ -284,7 +258,7 @@ def get_data_periodically():
                 continue
             if timer % schema["API"]["cycle"] != 0:
                 continue
-            address = schema.get("API").get("address")
+            address = schema.get("API").get("address")    
             if (address) and (schema.get("API").get("protocol") == 'REST'):
                 method = schema.get("API").get("method")
                 try:
@@ -304,10 +278,10 @@ def get_data_periodically():
                         print(f"Failed to get data from {key}.")
                 except requests.ConnectionError as e:
                     print(f"Connection error: {e}. Skipping {address}")
-            # elif (address) and (schema.get("API").get("protocol") == 'RTSP') and (schema["c_flag"] == 0):
-            #     schema["c_flag"] = 1
-            #     rtsp_thread_worker = threading.Thread(target=rtsp_thread, args=(address,))
-            #     rtsp_thread_worker.start()
+            elif (address) and (schema.get("API").get("protocol") == 'RTSP') and (schema["c_flag"] == 0):
+                schema["c_flag"] = 1
+                rtsp_thread_worker = threading.Thread(target=rtsp_thread, args=(address,))
+                rtsp_thread_worker.start()
     end_time = time.time()
     duration = end_time - start_time
     print(f"100API took {duration} seconds to execute.")
@@ -339,7 +313,6 @@ def storage_thread():
                             print(item.class_name_suffix)
                             session.add(item)
                         session.commit()
-                        print("storage success")
                     # 清空缓存
                     deal_data_cache.clear()
                 except Exception as e:
@@ -358,46 +331,36 @@ def extrace_thread():
     while True:
         loop_start_time = time.time()
         raw_cache_lock.acquire()
+        print(len(raw_data_cache))
         if len(raw_data_cache) >= 10:
             for item in raw_data_cache:
                 orm = item["orm"]
                 del item["orm"]
-                dictionary = {}
                 sister_dic = {}
-                dictionary, sister_dic = extract_and_remove_sub_dicts(item, sister_dic)
-                print(dictionary)
+                _, sister_dic = extract_and_remove_sub_dicts(item, sister_dic)
                 deal_cache_lock.acquire()
                 timestamp = None
-                if sister_dic != {}:
-                    for key, value in sister_dic.items():
-                        if key in orm:
-                            orm_class = orm[key]
-                            if type(value) is list:
-                                orm_instances = [orm_class(**item) for item in value]
-                                deal_data_cache.append(orm_instances)
-                            elif type(value) is dict:
-                                orm_instance = orm_class(**value)
-                                if timestamp is None:
-                                    orm_instance.timestamp = str(time.time())
-                                    timestamp = orm_instance.timestamp
-                                elif timestamp is not None:
-                                    orm_instance.timestamp = timestamp
-                                deal_data_cache.append(orm_instance)
-                                print(timestamp)
-                if dictionary != {}:
-                    orm_class = orm["root"]
-                    instance = orm_class()
-                    for key, value in dictionary.items():
-                        setattr(instance, key, value)
-                        setattr(instance, "timestamp", str(time.time()))
-                    deal_data_cache.append(instance)
+                for key, value in sister_dic.items():
+                    if key in orm:
+                        orm_class = orm[key]
+                        if type(value) is list:
+                            orm_instances = [orm_class(**item) for item in value]
+                            deal_data_cache.append(orm_instances)
+                        elif type(value) is dict:
+                            orm_instance = orm_class(**value)
+                            if timestamp is None:
+                                orm_instance.timestamp = str(time.time())
+                                timestamp = orm_instance.timestamp
+                            elif timestamp is not None:
+                                orm_instance.timestamp = timestamp
+                            deal_data_cache.append(orm_instance)
+                            print(timestamp)
                 deal_cache_lock.release()
             raw_data_cache.clear()
         raw_cache_lock.release()
         end_time = time.time()
         duration = end_time - loop_start_time
         print(f"100API took {duration} seconds to extrace.")
-        print(len(deal_data_cache))
         wait_time = max(0, 1 - duration)
         time.sleep(wait_time)
 
@@ -438,7 +401,7 @@ def delete_folder_contents(folder_path):
 
 def handle_exit(signum, frame):
     print("Received exit signal.")
-    delete_folder_contents(nginx_config["user_config_path"])  # Replace with your folder path
+    delete_folder_contents("/usr/local/nginx/conf/usr_conf")  # Replace with your folder path
     exit(0)
 
 
@@ -456,12 +419,12 @@ def generate_proxy_config(upstream_name, path):
 
 
 def add_config_to_nginx(config_name, config):
-    with open(nginx_config["user_config_path"] + f'/{config_name}.conf', 'w') as f:
+    with open(f'/usr/local/nginx/conf/usr_conf/{config_name}.conf', 'w') as f:
         f.write(config)
 
 
 def reload_nginx():
-    os.system(nginx_config["install_path"] + ' -s reload')
+    os.system('/usr/local/nginx/sbin/nginx -s reload')
 
 
 @app.route('/add_proxy', methods=['POST'])
@@ -483,7 +446,7 @@ def add_proxy():
         for key in hostname_schemas_orms:
             if key == host_name:
                 for item in hostname_schemas_orms[key]["schemas"]:
-                    if item["API"]["address"] == upstream_name:
+                    if item["API"]["address"] == upstream_name:                
                         item["API"]["proxy"] = 1
     hostlist_lock.release()
     return "success"
@@ -506,7 +469,7 @@ def delete_proxy():
                 for item in hostname_schemas_orms[key]["schemas"]:
                     if item["API"]["address"] == upstream_name:
                         item["API"]["proxy"] = 0
-                        delete_specific_files(nginx_config["user_config_path"], [f"{host_name}_{last_part}.conf"])
+                        delete_specific_files('/usr/local/nginx/conf/usr_conf', [f"{host_name}_{last_part}.conf"])
                         reload_nginx()
     hostlist_lock.release()
     return "success"
@@ -527,7 +490,6 @@ def get_devices():
 @app.route('/get_api', methods=['POST'])
 def get_api():
     hosts = request.json["hosts"]
-    print(hosts)
     data = {}
     for key in hostname_schemas_orms:
         if key in hosts:
@@ -649,7 +611,7 @@ def is_nginx_running():
 
 
 def start_nginx():
-    subprocess.run([nginx_config["install_path"]])
+    subprocess.run(['/usr/local/nginx/sbin/nginx'])
 
 
 if not is_nginx_running():
@@ -665,8 +627,8 @@ ext_thread = threading.Thread(target=extrace_thread)
 ext_thread.start()
 clock_thread = threading.Thread(target=clock_thread)
 clock_thread.start()
-os.system(nginx_config["install_path"] + ' -s reload')
+os.system('/usr/local/nginx/sbin/nginx -s reload')
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=server_port)
+    app.run(host='0.0.0.0', port=8080)
     session.close()
 # 1s 82api
