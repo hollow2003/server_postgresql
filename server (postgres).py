@@ -577,8 +577,8 @@ def add_interest_topic():
 #     "interest":[
 #         {
 #             "host_name" : "robot_1",
-#             "interest_topic" :  [{"address": "http://127.0.0.1:8093/api/move",
-#                                   "cycle": "1"}]
+#             "interest_topic" :  [{"API":{"address": "http://127.0.0.1:8093/api/move",
+#                                   "cycle": "1"}}]
 #         }
 #     ]
 # }
@@ -604,7 +604,7 @@ def cancel_interest_topic():
 #     "interest":[
 #         {
 #             "host_name" : "robot_1",
-#             "interest_topic" :  [{"address": "http://127.0.0.1:8093/api/move"}]
+#             "interest_topic" :  [{"API": {"address": "http://127.0.0.1:8093/api/move"}}]
 #         }
 #     ]
 # }
