@@ -78,7 +78,7 @@ def receive_udp_message():
             hostlist_lock.acquire()
             if hostname not in hostname_schemas_orms:
                 hostname_schemas_orms[hostname] = {}
-                get_schema(address, hostname)
+            get_schema(address, hostname)
             hostlist_lock.release()
         else:
             print("无法解析消息中的端口号和主机名")
@@ -90,11 +90,25 @@ def get_schema(address, hostname):
     response = requests.get(url)
     if response.status_code == 200:
         schemas = response.json()
-        hostname_schemas_orms[hostname]["schemas"] = schemas
+        lock.acquire()
         for schema in schemas:
-            schema["API"]["proxy"] = 0
-            schema["established"] = 0
-            schema["API"]["interested"] = 0
+            exist = False
+            if 'schemas' in hostname_schemas_orms[hostname]:
+                for item in hostname_schemas_orms[hostname]["schemas"]:
+                    if schema["API"]["address"] == item["API"]["address"]:
+                        schema["API"]["proxy"] = item["API"]["proxy"]
+                        schema["API"]["interested"] = item["API"]["interested"]
+                        if schema["API"]["interested"] == 1:
+                            schema["API"]["cycle"] = item["API"]["cycle"]
+                        exist = True
+                        break
+            if not exist:
+                schema["API"]["proxy"] = 0
+                schema["established"] = 0
+                schema["API"]["interested"] = 0
+        hostname_schemas_orms[hostname]["schemas"] = schemas
+        lock.release()
+        for schema in schemas:
             lock.acquire()
             print(type(schema["id"]))
             schema["orm"] = generate_orm(schema_to_tree(schema['schema']), schema["kind"] + "_" + str(schema["id"]), Path=hostname, required=extract_required(schema['schema']))
