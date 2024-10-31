@@ -1,0 +1,12 @@
+[Unit]
+After=network.service
+# After表示在哪个服务启动后启动我们的程序，After=network.service 表示网络连接完成后，启动我们的程序
+
+[Service]
+ExecStart=/home/ai801/ability_status_collect/service/database_query.sh
+# ExecStart表示我们的脚本（步骤1中的test.sh)的执行路径
+
+[Install]
+WantedBy=default.target
+# WantedBy默认填default.target，表示我们程序所在的服务组。
+
