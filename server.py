@@ -17,10 +17,10 @@ from collections import defaultdict
 engine = create_engine('postgresql://postgres:123456@192.168.1.206:6543/postgres', echo=True, future=True)
 app = Flask(__name__)
 Base = declarative_base()
-lock = threading.Lock()
 raw_cache_lock = threading.Lock()
 deal_cache_lock = threading.Lock()
 hostlist_lock = threading.Lock()
+ttl_lock = threading.Lock()
 Session = sessionmaker(bind=engine, future=True)
 session = Session()
 # 存储接收到的 UDP 消息
@@ -31,6 +31,7 @@ raw_data_cache = []
 deal_data_cache = []
 suffix = {}
 timer = 1
+hostname_ttl = {}
 
 
 def receive_udp_message():
@@ -47,11 +48,7 @@ def receive_udp_message():
         hostname = parts[0]
         if port and hostname:
             address = f"http://{ip}:{port}"
-            hostlist_lock.acquire()
-            if hostname not in hostname_schemas_orms:
-                hostname_schemas_orms[hostname] = {}
-            get_schema(address, hostname)
-            hostlist_lock.release()
+            threading.Thread(target=get_schema, args=(address, hostname)).start()
         else:
             print("无法解析消息中的端口号和主机名")
             # print(f"Received UDP message: {udp_message}")
@@ -63,14 +60,19 @@ def get_schema(address, hostname):
     url = f"{address}/data_discovery"
     response = requests.get(url)
     if response.status_code == 200 and response.json():
-        lock.acquire()
+        hostlist_lock.acquire()
+        if hostname not in hostname_schemas_orms:
+            hostname_schemas_orms[hostname] = {}
+        ttl_lock.acquire()
+        hostname_ttl[hostname] = 30
+        ttl_lock.release()
         schemas = response.json()
         for schema in schemas:
             exist = False
             if 'schemas' in hostname_schemas_orms[hostname]:
                 for item in hostname_schemas_orms[hostname]["schemas"]:
                     if item["API"]["address"] == schema["API"]["address"]:
-                        schema["API"]["proxy"] = item["API"]["proxy"];
+                        schema["API"]["proxy"] = item["API"]["proxy"]
                         schema["API"]["interested"] = item["API"]["interested"]
                         schema["API"]["cycle"] = item["API"]["cycle"]
                         exist = True
@@ -82,22 +84,26 @@ def get_schema(address, hostname):
                 schema["API"]["cycle"] = 0
             schema["established"] = 0
         hostname_schemas_orms[hostname]["schemas"] = schemas
-        lock.release()
         for schema in schemas:
-            lock.acquire()
             # print(type(schema["id"]))
             suffix[schema["kind"] + "_" + str(schema["id"])] = 1
             schema["orm"] = generate_orm(schema_to_tree(schema['schema']), schema["kind"] + "_" + str(schema["id"]), Path=hostname, required=extract_required(schema['schema']))
             Base.metadata.create_all(engine)
             Base.metadata.clear()
-            lock.release()
             if schema["orm"] is not None:
                 schema["established"] = 1
             if schema.get('API').get('protocol') == 'RTSP':
                 schema["c_flag"] = 0
+        hostlist_lock.release()
     else:
+        ttl_lock.acquire()
+        if hostname in hostname_ttl:
+            del hostname_ttl[hostname]
+        ttl_lock.release()
+        hostlist_lock.acquire()
         if hostname in hostname_schemas_orms:
             del hostname_schemas_orms[hostname]
+        hostlist_lock.release()
         print(f"Failed to get {hostname} schema.")
 
 
@@ -252,7 +258,9 @@ def extract_and_remove_sub_dicts(dictionary, sister_dic):
 
 def init_local_data():
     global hostname_schemas_orms
+    hostlist_lock.acquire()
     local_data.hostname_schemas_orms = hostname_schemas_orms.copy()
+    hostlist_lock.release()
 
 
 def get_local_data():
@@ -280,7 +288,7 @@ def get_data_periodically():
             if (address) and (schema.get("API").get("protocol") == 'REST'):
                 method = schema.get("API").get("method")
                 try:
-                    response = requests.request(method, address)
+                    response = requests.request(method, address, timeout=0.1)
                     if response.status_code == 200:
                         data = response.json()
                         print(f"Received data from {key}: {data}")
@@ -289,13 +297,14 @@ def get_data_periodically():
                                 data = {"root": data}
                             data["orm"] = schema["orm"]
                             data["timestamp"] = str(int(time.time()))
-                            print(data["timestamp"])
+                            # print(data["timestamp"])
                             raw_cache_lock.acquire()
-                            # print(str(data) + "add to raw data")
+                            print(str(data) + "add to raw data")
                             raw_data_cache.append(data)
                             raw_cache_lock.release()
                     else:
                         print(f"Failed to get data from {key}.")
+                        continue
                 except requests.ConnectionError as e:
                     print(f"Connection error: {e}. Skipping {address}")
             elif (address) and (schema.get("API").get("protocol") == 'RTSP') and (schema["c_flag"] == 0):
@@ -310,15 +319,18 @@ def get_data_periodically():
 def periodic_data_thread():
     with ThreadPoolExecutor(max_workers=16) as executor:
         while True:
-            future = executor.submit(get_data_periodically)
+            executor.submit(get_data_periodically)
             time.sleep(1)
-            future.result()
 
 
 def storage_thread():
     while True:
+        # print('del_data_len')
+        # print(len(deal_data_cache))
         loop_start_time = time.time()
         deal_cache_lock.acquire()
+        print('del_data_len')
+        print(len(deal_data_cache))
         if len(deal_data_cache) >= 10:
             deal_data_cache.sort(key=lambda x: x.class_name_suffix, reverse=True)
             grouped_data = defaultdict(list)
@@ -340,7 +352,7 @@ def storage_thread():
                 except Exception as e:
                     session.rollback()
                     print(f"Error during storage: {e}")
-        deal_data_cache.clear()
+            deal_data_cache.clear()
         deal_cache_lock.release()
         end_time = time.time()
         duration = end_time - loop_start_time
@@ -353,6 +365,8 @@ def extrace_thread():
     while True:
         loop_start_time = time.time()
         raw_cache_lock.acquire()
+        # print('raw_data_len')
+        # print(len(raw_data_cache))
         if len(raw_data_cache) >= 10:
             for item in raw_data_cache:
                 orm = item["orm"]
@@ -399,9 +413,22 @@ def extrace_thread():
 
 def clock_thread():
     while True:
+        print(hostname_ttl)
+        start_time = time.time()
         global timer
         timer = (timer + 1) % 10000
-        time.sleep(1)
+        ttl_lock.acquire()
+        for key in list(hostname_ttl.keys()):
+            hostname_ttl[key] -= 1
+            if hostname_ttl[key] < 0:
+                hostlist_lock.acquire()
+                if key in hostname_schemas_orms:
+                    del hostname_schemas_orms[key]
+                hostlist_lock.release()
+                del hostname_ttl[key]
+        ttl_lock.release()
+        end_time = time.time()
+        time.sleep(max(0, 1 - end_time + start_time))
 
 
 def delete_specific_files(folder_path, filenames):
@@ -514,15 +541,18 @@ def delete_proxy():
 @app.route('/get_devices', methods=['GET'])
 def get_devices():
     data = {"host": []}
+    hostlist_lock.acquire()
     for key in hostname_schemas_orms:
         if hostname_schemas_orms[key]!={}:
             data["host"].append(key)
+    hostlist_lock.release()
     print(data)
     return data
 
 
 @app.route('/get_api', methods=['POST'])
 def get_api():
+    hostlist_lock.acquire()
     print(hostname_schemas_orms)
     hosts = request.json["hosts"]
     print(hosts)
@@ -540,7 +570,11 @@ def get_api():
                 api_data["protocol"] = item["API"]["protocol"]
                 api_data["proxy"] = item["API"]["proxy"]
                 data[key].append(api_data)
-    return data
+    hostlist_lock.release()
+    if data:
+        return data
+    else:
+        return "hosts not regist"
 # {"hosts" : ["robot_1","robot_2"]}
 
 
@@ -563,6 +597,7 @@ def add_interest_topic():
                         schema["API"]["cycle"] = int(topic_and_cycle["API"]["cycle"])
                         break
         else:
+            hostlist_lock.release()
             return "some device or topic not found"
     hostlist_lock.release()
     return "receive interest topic"
@@ -590,6 +625,7 @@ def cancel_interest_topic():
                         schema["API"]["cycle"] = 1
                         break
         else:
+            hostlist_lock.release()
             print("not found")
             return "some device or topic not found"
     hostlist_lock.release()
@@ -608,8 +644,11 @@ def cancel_interest_topic():
 def get_latest_location():
     data = request.json
     host_name = data["host_name"]
+    hostlist_lock.acquire()
     if host_name not in hostname_schemas_orms:
+        hostlist_lock.release()
         return "device not found"
+    hostlist_lock.release()
     try:
         # 连接数据库
         conn = sqlite3.connect('server.db')
@@ -641,7 +680,9 @@ def get_latest_location():
 
 @app.route('/query_by_orm', methods=['GET'])
 def query_by_orm():
+    hostlist_lock.acquire()
     users = session.query(hostname_schemas_orms["robot_1"]["schemas"][0]["orm"]["Location"]).all()
+    hostlist_lock.release()
     # 构建 SQL 查询语句
     for user in users:
         print(f"timestamp: {user.timestamp}")
